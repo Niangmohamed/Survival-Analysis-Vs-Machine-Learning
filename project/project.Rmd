@@ -1,0 +1,519 @@
+---
+title: "Survival Analysis Versus Classification"
+author: 
+   - NIANG Mohamed
+   - DAVIDAS ROCH Anthnony
+   - KAINA Mohamed Abdellah
+date: "8 Novembre 2019"
+output:
+  pdf_document: 
+    highlight: haddock
+    number_sections: yes
+    toc: yes
+---
+
+```{r setup, include=FALSE, results='asis'}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+The wpbc dataset (available at https://archive.ics.uci.edu/ml/machine learningdatabases/breast-cancer-wisconsin/wpbc.data). It is available at https://archive.ics.uci.edu/ml/machinelearning databases/breast-cancer-wisconsin/wpbc.names.
+We want to predict the probability of relapse ("recurrent") at 24 months. To do this, you will compare the methods of survival analysis (Cox models, survival random forests,...) with the classification methods. Performance measurements (including AUC) will be made on a test sub-sample consisting of 20 to 30% of the data (be careful to stratify well!).
+
+# Preliminaries
+## Set Working Directory
+```{r working directory}
+WORKING_DIR <- "C:/Users/HP/Desktop/Lab 4" 
+(WORKING_DIR)
+getwd()
+```
+
+## Load libraries
+
+```{r loadLibraries}
+# Load Libraries 
+library(ggfortify)
+library(MASS)
+library(knitr) # Markdown 
+library(kableExtra)
+library(KMsurv)
+library(caret)
+library(e1071)
+library(glmnet)
+library(tidyverse)
+library(randomForest)
+library(randomForestSRC)
+library(survival)
+library(foreign) # For reading and writing data stored
+library(RWeka) # Weka 
+library(ROCR)
+library(pROC)
+library(cvAUC) # AUC for classification
+library(survAUC) # AUC for Survival
+library(risksetROC) # AUC for Survival Random Forest
+library(CoxBoost) # For Cox Boost Model
+library(coxrobust) # For Cox Robust Model
+```
+
+## Load data
+```{r loadData}
+### Load data
+wpbc = read_delim("wpbc.data",delim=",",col_names=F,na = '?')
+
+names_cov = paste0(rep(c('radius','texture','perimeter','area','smoothness','compactness',
+                         'concavity','concave_points','symmetry','fractal_dimension'),3),
+                   c(rep('_mean',10),rep('_SD',10),rep('_worst',10)))
+
+names(wpbc) = c('id','recurrent','time',names_cov,c('Tumor_size','Lymph_node_status'))
+
+wpbc = wpbc %>% mutate(id = factor(id)) %>% 
+                mutate( recurrent = recode_factor(recurrent , "N" = FALSE, 'R' = TRUE )) 
+glimpse(wpbc)
+```
+
+
+------
+
+# Exploratory data analysis
+```{r}
+DATASET <- as.data.frame(wpbc)
+```
+
+
+## Look at the data set 
+
+```{r}
+head(DATASET)
+dim(DATASET)
+colnames(DATASET)
+summary(DATASET)
+```
+
+## Preprocessing of NA value
+```{r}
+summary(is.na(DATASET))
+```
+
+## Replace the NA value with the median value of variable(numeric)
+```{r}
+DATASET = DATASET %>% replace_na(list(`Lymph_node_status` = median(DATASET$`Lymph_node_status`, na.rm = T)))
+# Verification
+summary(is.na(DATASET))
+```
+
+## Normalize the data
+```{r}
+# Normalized dataset
+normalize <- function(x){
+  return ((x-mean(x, na.rm = T))/(sd(x, na.rm = T)))
+}
+DATASET_NORMALIZE = DATASET %>% mutate_at(-c(1,2,3), normalize)
+```
+
+## Recode the target variable
+```{r}
+DATASET_NORMALIZE = DATASET_NORMALIZE %>% arrange(time)
+DATASET_FINAL = DATASET_NORMALIZE %>% 
+                mutate(outcome_classif = 
+                ifelse((time <= 24)&(recurrent==TRUE),1,
+                ifelse((time > 24)&(recurrent==TRUE),0,
+                ifelse((time > 24)&(recurrent==FALSE),0,NA))))
+
+```
+
+## Delete the NA value in the outcome variable
+```{r}
+DATASET_FINAL = DATASET_FINAL[!is.na(DATASET_FINAL[,"outcome_classif"]),]
+```
+
+## Delete the row that contain NA
+```{r}
+DATASET_FINAL = na.omit(DATASET_FINAL)
+```
+
+## Train test split With stratification 
+```{r}
+set.seed(1234)
+DATASET_FINAL = DATASET_FINAL %>% mutate(id_1n = c(1:nrow(DATASET_FINAL)))
+train_index = createDataPartition(DATASET_FINAL$recurrent, p = 0.8, list = FALSE, times = 1)
+
+DATASET_TRAIN = DATASET_FINAL[train_index,]
+DATASET_TEST = DATASET_FINAL[-train_index,]
+
+print(nrow(DATASET_TRAIN))
+print(nrow(DATASET_TEST))
+```
+
+## Transformation. Transform Label as Factor (Categorical) and Change Column Names (TRAINING data set)
+```{r}
+DATASET_TRAIN = dplyr::select(DATASET_TRAIN,-c("id","recurrent","time","id_1n"))
+DATASET_TEST = dplyr::select(DATASET_TEST,-c("id","recurrent","time","id_1n"))
+
+DATASET_TRAIN$outcome_classif <- as.factor(DATASET_TRAIN$outcome_classif) # As Category
+class(DATASET_TRAIN$outcome_classif)
+levels(DATASET_TRAIN$outcome_classif)
+```
+
+# Machine Learning Classifiers
+
+## Classification. Predictive Model. Random Forest Algorithm
+
+```{r}
+pc <- proc.time()
+model.forest <- randomForest(DATASET_TRAIN$outcome_classif ~ ., method="class", data = DATASET_TRAIN)
+proc.time() - pc
+```
+
+### Confusion Matrix (Random Forest)
+```{r}
+prediction.forest <- predict(model.forest, newdata=DATASET_TEST, type='class')
+table("Actual Class" = DATASET_TEST$outcome_classif, "Predicted Class"=prediction.forest)
+error.rate.forest <- sum(DATASET_TEST$outcome_classif != prediction.forest) / nrow(DATASET_TEST)
+accuracy.forest <- 1 - error.rate.forest
+print (paste0("Accuary Random Forest (Precision): ", accuracy.forest))
+```
+
+### ROC curve Random Forest (x-axis: fpr, y-axis: tpr)
+```{r}
+pred.forest <- prediction(DATASET_TEST$outcome_classif, prediction.forest)
+perf.forest <- performance(pred.forest, "tpr", "fpr")
+autoplot(perf.forest, main = 'ROC curve Random Forest')
+```
+
+### Precision/recall curve Random Forest (x-axis: recall, y-axis: precision)
+```{r}
+perf2.forest <- performance(pred.forest, "prec", "rec")
+autoplot(perf2.forest, main = 'Precision/recall curve Random Forest')
+```
+
+### Sensitivity/specificity curve Random Forest (x-axis: specificity, y-axis: sensitivity)
+```{r}
+perf2.forest <- performance(pred.forest, "sens", "spec")
+autoplot(perf2.forest, main = 'Sensitivity/specificity curve Random Forest')
+```
+
+### AUC Random Forest
+```{r}
+auc.forest <- AUC(DATASET_TEST$outcome_classif, prediction.forest)
+print (paste0("AUC Random Forest : ", auc.forest))
+```
+
+------
+
+## Classification. k-Nearest Neighbors (kNN) Algorithm 
+
+```{r}
+pc <- proc.time()
+model.knn <- IBk(DATASET_TRAIN$outcome_classif ~ . , data=DATASET_TRAIN)
+proc.time() - pc
+summary(model.knn)
+```
+
+### Confusion Matrix (kNN)
+```{r}
+prediction.knn <- predict(model.knn, newdata=DATASET_TEST, type='class')
+table("Actual Class"=DATASET_TEST$outcome_classif, "Predicted Class"=prediction.knn)
+error.rate.knn <- sum(DATASET_TEST$outcome_classif != prediction.knn) / nrow(DATASET_TEST)
+print (paste0("Accuary kNN (Precision): ", 1 - error.rate.knn))
+```
+
+### ROC curve kNN (x-axis: fpr, y-axis: tpr)
+```{r}
+pred.knn <- prediction(DATASET_TEST$outcome_classif, prediction.knn)
+perf.knn <- performance(pred.knn, "tpr", "fpr")
+autoplot(perf.knn, main = 'ROC curve kNN')
+```
+
+### Precision/recall curve KNN (x-axis: recall, y-axis: precision)
+```{r}
+perf2.knn <- performance(pred.knn, "prec", "rec")
+autoplot(perf2.knn, main = 'Precision/recall curve KNN')
+```
+
+### Sensitivity/specificity curve KNN (x-axis: specificity, y-axis: sensitivity)
+```{r}
+perf2.knn <- performance(pred.knn, "sens", "spec")
+autoplot(perf2.knn, main = 'Sensitivity/specificity curve KNN')
+```
+
+### AUC KNN
+```{r}
+auc.knn <- AUC(DATASET_TEST$outcome_classif, prediction.knn)
+print (paste0("AUC KNN : ", auc.knn))
+```
+
+------
+
+## Classification. Predictive Model. Naive Bayes Algorithm 
+```{r}
+pc <- proc.time()
+model.naiveBayes <- naiveBayes(DATASET_TRAIN$outcome_classif ~ . , data=DATASET_TRAIN)
+proc.time() - pc
+summary(model.naiveBayes)
+```
+
+### Confusion Matrix (naiveBayes)
+```{r}
+prediction.naiveBayes <- predict(model.naiveBayes, newdata=DATASET_TEST, type='class')
+table("Actual Class"=DATASET_TEST$outcome_classif, "Predicted Class"=prediction.naiveBayes)
+error.rate.naiveBayes <- sum(DATASET_TEST$outcome_classif != prediction.naiveBayes) / nrow(DATASET_TEST)
+print (paste0("Accuary naiveBayes (Precision): ", 1 - error.rate.naiveBayes))
+```
+
+### ROC curve naiveBayes (x-axis: fpr, y-axis: tpr)
+```{r}
+pred.naiveBayes <- prediction(DATASET_TEST$outcome_classif, prediction.naiveBayes)
+perf.naiveBayes <- performance(pred.naiveBayes, "tpr", "fpr")
+autoplot(perf.naiveBayes, main = 'ROC curve naiveBayes')
+```
+
+### Precision/recall curve naiveBayes (x-axis: recall, y-axis: precision)
+```{r}
+perf2.naiveBayes <- performance(pred.naiveBayes, "prec", "rec")
+autoplot(perf2.naiveBayes, main = 'Precision/recall curve naiveBayes')
+```
+
+### Sensitivity/specificity curve naiveBayes (x-axis: specificity, y-axis: sensitivity)
+```{r}
+perf2.naiveBayes <- performance(pred.naiveBayes, "sens", "spec")
+autoplot(perf2.naiveBayes, main = 'Sensitivity/specificity curve naiveBayes')
+```
+
+### AUC naiveBayes
+```{r}
+auc.naiveBayes <- AUC(DATASET_TEST$outcome_classif, prediction.naiveBayes)
+print (paste0("AUC naiveBayes : ", auc.naiveBayes))
+```
+
+------
+
+## Classification. Predictive Model. Logistic Regression Algorithm 
+```{r}
+pc <- proc.time()
+model.logistic <- glm(DATASET_TRAIN$outcome_classif ~ . , data=DATASET_TRAIN, family = binomial(logit))
+proc.time() - pc
+```
+
+### Confusion Matrix (Logistic Regression)
+```{r}
+prediction.logistic <- predict.glm(model.logistic, newdata=DATASET_TEST, type="response")
+sprediction.logistic <- prediction.logistic > 0.5
+confusion.matrix <- table("Actual Class" = DATASET_TEST$outcome_classif, "Predicted Class" = sprediction.logistic)
+confusion.matrix
+error.rate.logistic <- (confusion.matrix[2,1]+confusion.matrix[1,2])/sum(confusion.matrix)
+print (paste0("Accuary Logistic Regression (Precision): ", 1 - error.rate.logistic))
+```
+
+### ROC curve Logistic Regression (x-axis: fpr, y-axis: tpr)
+```{r}
+pred.logistic <- prediction(DATASET_TEST$outcome_classif, sprediction.logistic)
+perf.logistic <- performance(pred.logistic, "tpr", "fpr")
+autoplot(perf.logistic, main = 'ROC curve Logistic Regression')
+```
+
+### Precision/recall curve Logistic Regression (x-axis: recall, y-axis: precision)
+```{r}
+perf2.logistic <- performance(pred.logistic, "prec", "rec")
+autoplot(perf2.logistic, main = 'Precision/recall curve Logistic Regression')
+```
+
+### Sensitivity/specificity curve Logistic Regression (x-axis: specificity, y-axis: sensitivity)
+```{r}
+perf2.logistic <- performance(pred.logistic, "sens", "spec")
+autoplot(perf2.logistic, main = 'Sensitivity/specificity curve Logistic Regression')
+```
+
+### AUC Logistic Regression
+```{r}
+auc.logistic <- AUC(DATASET_TEST$outcome_classif, sprediction.logistic)
+print (paste0("AUC : ", auc.logistic))
+```
+
+------
+
+# Survival Analysis
+
+## Preprocessing 
+
+```{r}
+DATASET_TRAIN2 = DATASET_FINAL[train_index,]
+DATASET_TEST2 = DATASET_FINAL[-train_index,]
+```
+
+
+```{r}
+DATASET_TRAIN3 = dplyr::select(DATASET_TRAIN2,-c("id","id_1n","outcome_classif"))
+DATASET_TRAIN3$recurrent = as.logical(DATASET_TRAIN3$recurrent)
+
+DATASET_TEST3 = dplyr::select(DATASET_TEST2,-c("id","id_1n","outcome_classif"))
+DATASET_TEST3$recurrent = as.logical(DATASET_TEST3$recurrent)
+```
+
+## Cox Model
+
+```{r}
+pc <- proc.time()
+cox_all = coxph(Surv(time,recurrent)~., data=DATASET_TRAIN3,x=T,y=T)
+proc.time() - pc
+cox_fit <- survfit(cox_all)
+autoplot(cox_fit)
+```
+
+```{r}
+cox_AIC = stepAIC(cox_all,trace=F)
+summary(cox_AIC)
+cox_AIC$score
+```
+
+
+```{r}
+summary(survfit(cox_all), time=24)
+summary(survfit(cox_AIC), time=24)
+```
+
+The survival probability at time 24 is approximately 92%.
+
+### AUC Cox Model 
+```{r}
+lp <- predict(cox_AIC)
+lpnew <- predict(cox_AIC, newdata=DATASET_TEST3)
+Surv.rsp <- Surv(DATASET_TRAIN3$time, DATASET_TRAIN3$recurrent)
+Surv.rsp.new <- Surv(DATASET_TEST3$time, DATASET_TEST3$recurrent)
+times <- seq(10, 1000, 10)                  
+
+AUC_CD.cox <- AUC.cd(Surv.rsp, Surv.rsp.new, lp, lpnew, times)
+auc.cox <- AUC_CD.cox[3]
+print (paste0("AUC Cox Model : ", auc.cox))
+auc.cox <- 0.856123737622364
+```
+
+------
+
+
+## Survival Random Forests 
+
+```{r}
+pc <- proc.time()
+rf_surv = rfsrc(Surv(time,recurrent)~radius_mean + perimeter_mean + 
+    area_mean + smoothness_mean + concavity_mean + fractal_dimension_mean + 
+    area_SD + compactness_SD + concave_points_SD + symmetry_SD + 
+    radius_worst + texture_worst + area_worst + compactness_worst + 
+    concavity_worst + Tumor_size,DATASET_TRAIN3)
+proc.time() -pc
+rf_surv
+pred_rf=predict(rf_surv,DATASET_TEST3,outcome="test")
+pred_rf
+```
+
+
+
+
+
+
+### AUC Survival Random Forests
+
+```{r}
+w.ROC1 = risksetAUC(Stime = DATASET_TEST3$time,  
+                   status = DATASET_TEST3$recurrent, 
+                   marker = pred_rf$predicted.oob, tmax = 250, plot = F)
+w.ROC1
+print (paste0("Survival probability at time ", 24," is between ",w.ROC1$St[9]," and ",w.ROC1$St[8]))
+print (paste0("AUC Survival Random Forestsl : ", w.ROC1$Cindex))
+auc.srf <- 0.576696507918134
+```
+
+------
+
+## Cox Boost Model
+```{r}
+pc <- proc.time()
+coxboost_surv = iCoxBoost(Surv(time,recurrent) ~.,data=DATASET_TRAIN3)
+proc.time() -pc
+summary(coxboost_surv)
+```
+
+```{r}
+pc <- proc.time()
+coxboost_surv = iCoxBoost(Surv(time,recurrent) ~ radius_mean + perimeter_mean + 
+    area_mean + smoothness_mean + concavity_mean + fractal_dimension_mean + 
+    area_SD + compactness_SD + concave_points_SD + symmetry_SD + 
+    radius_worst + texture_worst + area_worst + compactness_worst + 
+    concavity_worst + Tumor_size,data=DATASET_TRAIN3)
+proc.time() - pc
+summary(coxboost_surv)
+```
+
+### AUC Cox Boost Model 
+```{r}
+lp2 <- predict(coxboost_surv)
+lpnew2 <- predict(coxboost_surv, newdata=DATASET_TEST3)
+Surv.rsp2 <- Surv(DATASET_TRAIN3$time, DATASET_TRAIN3$recurrent)
+Surv.rsp.new2 <- Surv(DATASET_TEST3$time, DATASET_TEST3$recurrent)
+times2 <- seq(10, 1000, 10)                  
+
+AUC_CD.coxboost <- AUC.cd(Surv.rsp2, Surv.rsp.new2, lp2, lpnew2, times2)
+auc.coxboost <- AUC_CD.coxboost[3]
+print (paste0("AUC Cox Boost Model : ", auc.coxboost))
+auc.coxboost <- 0.567571015744152
+```
+
+## Cox Robust Model
+```{r}
+pc <- proc.time()
+coxrobust_surv = coxr(Surv(time,recurrent) ~.,data=DATASET_TRAIN3)
+summary(coxrobust_surv)
+```
+
+
+```{r}
+pc <- proc.time()
+coxrobust_surv = coxr(Surv(time,recurrent) ~  radius_mean + perimeter_mean + 
+    area_mean + smoothness_mean + concavity_mean + fractal_dimension_mean + 
+    area_SD + compactness_SD + concave_points_SD + symmetry_SD + 
+    radius_worst + texture_worst + area_worst + compactness_worst + 
+    concavity_worst + Tumor_size,data=DATASET_TRAIN3)
+proc.time() - pc
+summary(coxrobust_surv)
+```
+
+
+### AUC Cox Robust Model
+```{r}
+lp3 <- predict(coxrobust_surv)
+Surv.rsp3 <- Surv(DATASET_TRAIN3$time, DATASET_TRAIN3$recurrent)
+Surv.rsp.new3 <- Surv(DATASET_TEST3$time, DATASET_TEST3$recurrent)
+times3 <- seq(10, 1000, 10)                  
+
+AUC_CD.coxrobust <- AUC.cd(Surv.rsp3, Surv.rsp.new3, lp3, lp3, times3)
+auc.coxrobust <- AUC_CD.coxrobust[3]
+print (paste0("AUC Cox Robust Model : ", auc.coxrobust))
+auc.coxrobust <- 0.813890605104405
+```
+
+# Model comparison and Conclusion
+
+## Model Comparison
+```{r, results='asis'}
+modelsclass <- c('randomforest', 'knn', 'naiveBayes', 'logreg')
+modelssurv <- c('cox', 'srf', 'boostcox', 'robustcox')
+aucmodelsclass <- c(auc.forest, auc.knn, auc.naiveBayes, auc.logistic)
+aucmodelssurv <- c(auc.cox, auc.srf, auc.coxboost, auc.coxrobust)
+resultsclass <- data.frame("Models Classifiers" = modelsclass, "AUC Classifiers" = aucmodelsclass)
+resultssurv <- data.frame("Models Survival" = modelssurv, "AUC Survival" = aucmodelssurv)
+
+resultfinal <- cbind(resultsclass,resultssurv)
+# Table comparison
+kable(arrange(resultfinal,desc(aucmodelsclass),desc(aucmodelssurv)), digits = 2) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"),
+                full_width = F,
+                font_size = 12,
+                position = "left")
+```
+
+## Conclusion
+
+From the results of the different models we have had, it seems that **the random forest for classification** model gives better results with an AUC of **0.88** and could be used for prediction for new observations. However, the **cox** model makes a good prediction with an AUC of **0.86**.
+
+------
+
+
